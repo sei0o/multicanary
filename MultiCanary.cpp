@@ -93,15 +93,16 @@ bool MultiCanary::runOnFunction(Function &F) {
   }
 
   // Store
-  BasicBlock *StoreNextBB = F.getEntryBlock();
+  BasicBlock *StoreBB = F.getEntryBlock();
+  BasicBlock *StoreNextBB = nullptr;
   for (unsigned i = 0; i < CanaryAIs.size(); ++i) {
     AllocaInst *BufferAI = AddedAIs[i];
+    AllocaInst *CanaryAI = CanaryAIs[i];
     if (BufferAI->getMultiCanarySize() == 0) continue;
 
-    AllocaInst *CanaryAI = CanaryAIs[i];
-
-    BasicBlock *StoreBB = CreateCanaryStoreBB(AI, &BB, AfterBB, &F, nCanary, LI, Weights);
-    if (i == 0) B.CreateBr(StoreNextBB);
+    BasicBlock *StoreNextBB = BasicBlock::Create(StorePrevBB->getContext());
+    BasicBlock *StoreBB = CreateCanaryStoreBB(AI, StorePrevBB, StoreNextBB, &F, nCanary, LI, Weights);
+    if (i == 0) B.CreateBr(StoreBB);
   }
 
   // Canaryの検証
@@ -134,13 +135,6 @@ bool MultiCanary::runOnFunction(Function &F) {
           BasicBlock *NextCheckBB = BasicBlock::Create(BB.getContext(), "MultiCanaryReturn", &F);
           BasicBlock *FirstCheckBB = NextCheckBB;
 
-          DominatorTreeWrapperPass *DTWP = getAnalysisIfAvailable<DominatorTreeWrapperPass>();
-          DominatorTree *DT = DTWP ? &DTWP->getDomTree() : nullptr;
-          if (DT && DT->isReachableFromEntry(&BB)) {
-            // BB is a dominator of FirstCheckBB.
-            DT->addNewBlock(FirstCheckBB, &BB);
-          }
-
           for (auto AI : CanaryAIs) {
             BasicBlock *CurrentBB = NextCheckBB;
             IRBuilder<> B(CurrentBB);
@@ -166,15 +160,7 @@ bool MultiCanary::runOnFunction(Function &F) {
               BasicBlock *ValidationBB = CreateValidationBB(AI, CurrentBB, NextCheckBB, FailBB, &F, cast<ConstantInt>(AI->getArraySize())->getZExtValue(), LoadCanaryTLS, Weights);
               B.CreateBr(ValidationBB);
             }
-
-            // if (DT && DT->isReachableFromEntry(&BB)) {
-            //   DT->addNewBlock(NextCheckBB, CurrentBB);
-            //   DT->addNewBlock(FailBB, CurrentBB);
-            // }
           }
-
-          // FIXME: 最初のCanary検証BasicBlockを前のBasicBlockとマージすると良さそう
-          // でも後ろの最適化でよしなにやってくれそうな気もする
 
           // 最後のBasicBlockにReturnInstを追加
           NextCheckBB->getInstList().push_back(RI->clone());
@@ -194,8 +180,8 @@ bool MultiCanary::runOnFunction(Function &F) {
 }
 
 // Canary配列の要素にに実際のCanary値をLoadするBBを追加する
-BasicBlock *MultiCanary::CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, MDNode *Weights) {
-  BasicBlock *HeadBB = BasicBlock::Create(ParentBB->getContext(), "MultiCanaryStore", F);
+BasicBlock *MultiCanary::CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *PreviousBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, MDNode *Weights) {
+  BasicBlock *HeadBB = BasicBlock::Create(PreviousBB->getContext(), "MultiCanaryStore", F);
   IRBuilder<> HB(HeadBB);
 
   Value *Offset = HB.CreateAlloca(HB.getInt64Ty());
