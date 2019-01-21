@@ -52,16 +52,24 @@ bool MultiCanary::runOnFunction(Function &F) {
   SmallVector<AllocaInst *, 16> CanaryAIs;
   SmallVector<AllocaInst *, 16> AddedAIs;
 
-  IRBuilder<> B(F.getEntryBlock()->getContext());
+  IRBuilder<> B(F.getEntryBlock().getTerminator()); // insert before the terminator
+  unsigned PtrSize = DL.getTypeAllocSize(B.getInt8PtrTy());
 
-  BasicBlock *Entry = F.getEntryBasicBlock();
-  for (auto &I : Entry) {
-    // Canaryの配置
+  Value *Canary = TLI->getIRStackGuard(B);
+
+  SmallVector<CallInst *, 16> IntrinsicCIs;
+  bool hasSizedCanary = false;
+
+  LoadInst *LI = new LoadInst(Canary, "MultiCanaryLoad");
+
+  // Allocate canary
+  AllocaInst *LastAlloca = nullptr;
+  for (auto &I : F.getEntryBlock()) {
     if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
       errs() << "---- found AllocaInst ----\n";
 
-      // skip MultiCanary related allocas.
-      if (AI->getName().startswith(StringRef("MultiCanary"))) continue;
+      // MultiCanaryAllocaはbufferのallocaの後に配置される
+      if (AI->getName().startswith(StringRef("MultiCanary"))) break;
 
       AI->dump();
 
@@ -69,40 +77,70 @@ bool MultiCanary::runOnFunction(Function &F) {
       AllocaInst *CanaryAI;
       if (CanarySize == 0) { // use the default size
         // %2 = alloca i8* (use i8* instead of i8 to be compatible with both of 32/64bit environment)
-        CanaryAI = B.CreateAlloca(B.getInt8PtrTy(), nullptr, "MultiCanaryAlloca");
+        CanaryAI = new AllocaInst(B.getInt8PtrTy(), 0, "MultiCanaryAlloca");
       } else { // use the specified size
-        unsigned PtrSize = DL.getTypeAllocSize(B.getInt8PtrTy());
         assert(CanarySize % PtrSize == 0 && "Size of canary must be a multiple of that of i8*");
-        CanaryAI = B.CreateAlloca(B.getInt8PtrTy(), ConstantInt::get(B.getInt32Ty(), CanarySize / PtrSize), "MultiCanaryAlloca");
+        hasSizedCanary = true;
+        CanaryAI = new AllocaInst(B.getInt8PtrTy(), 0, ConstantInt::get(B.getInt32Ty(), CanarySize / PtrSize), "MultiCanaryAlloca");
       }
 
       CanaryAIs.push_back(CanaryAI);
-      AddedAIs.push_back(&AI);
+      AddedAIs.push_back(AI);
+
+      LastAlloca = AI;
+      continue;
+    }
+
+    break; // entry blockの先頭からallocaが連続しているだけ見る
+  }
+
+  if (!LastAlloca) return false; // no allocas in the entry block
+
+  Instruction *Pos = LastAlloca->getNextNode();
+
+  LI->insertAfter(LastAlloca);
+
+  // Store procedure for large canaries
+  MDNode *Weights = MDBuilder(F.getContext()).createBranchWeights(1, 1);
+  BasicBlock *EntryAfterAlloca = nullptr;
+  BasicBlock *StoreBB = nullptr;
+  BasicBlock *StoreStubBB = &F.getEntryBlock();
+  for (unsigned i = 0; i < CanaryAIs.size(); ++i) {
+    StoreBB = StoreStubBB;
+    AllocaInst *BufferAI = AddedAIs[i];
+    AllocaInst *CanaryAI = CanaryAIs[i];
+
+    // insert before the branch
+    CanaryAI->insertBefore(LastAlloca);
+
+    // InsertBefore is a required parameter for CallInst constructor, so create one when we have LastAlloca.
+    std::vector<Value*> Args = {LI, CanaryAI, BufferAI};
+    ArrayRef<Value*> ArgsRef(Args);
+    Function *Int = Intrinsic::getDeclaration(M, Intrinsic::multicanary, {BufferAI->getType()});
+    CallInst *CI = CallInst::Create(Int, ArgsRef, "", Pos);
+
+    if (BufferAI->getMultiCanarySize() == 0) continue;
+
+    unsigned nCanary = BufferAI->getMultiCanarySize() / PtrSize;
+
+    StoreStubBB = BasicBlock::Create(StoreBB->getContext(), "MultiCanaryStub", &F);
+    BasicBlock *StoreNextBB = CreateCanaryStoreBB(CanaryAI, StoreBB, StoreStubBB, &F, nCanary, LI, PtrSize, Weights);
+    if (StoreBB != &F.getEntryBlock()) {
+      BranchInst::Create(StoreNextBB, StoreBB);
+    } else {
+      // After LI there should not be any MultiCanary related instructions in the entry block.
+      EntryAfterAlloca = F.getEntryBlock().splitBasicBlock(LI->getNextNode()->getIterator(), "MultiCanaryEntryAfterAlloca");
+      F.getEntryBlock().getTerminator()->eraseFromParent();
+      BranchInst::Create(StoreNextBB, &F.getEntryBlock());
     }
   }
 
-  // Call intrinsics
-  for (unsigned i = 0; i < CanaryAIs.size(); ++i) {
-    AllocaInst *CanaryAI = CanaryAIs[i];
-    AllocaInst *BufferAI = AddedAIs[i];
-
-    Value *Canary = TLI->getIRStackGuard(B);
-    LoadInst *LI = B.CreateLoad(Canary, "MultiCanaryLoad");
-
-    CallInst *CI = CallInst::Create(Intrinsic::getDeclaration(M, Intrinsic::multicanary, {AI->getType()}), {LI, CanaryAI, AI});
-  }
-
-  // Store
-  BasicBlock *StoreBB = F.getEntryBlock();
-  BasicBlock *StoreNextBB = nullptr;
-  for (unsigned i = 0; i < CanaryAIs.size(); ++i) {
-    AllocaInst *BufferAI = AddedAIs[i];
-    AllocaInst *CanaryAI = CanaryAIs[i];
-    if (BufferAI->getMultiCanarySize() == 0) continue;
-
-    BasicBlock *StoreNextBB = BasicBlock::Create(StorePrevBB->getContext());
-    BasicBlock *StoreBB = CreateCanaryStoreBB(AI, StorePrevBB, StoreNextBB, &F, nCanary, LI, Weights);
-    if (i == 0) B.CreateBr(StoreBB);
+  // Jump to the rest of the old entry block
+  LastAlloca->dump();
+  if (hasSizedCanary) {
+    EntryAfterAlloca->dump();
+    StoreStubBB->dump();
+    BranchInst::Create(EntryAfterAlloca, StoreStubBB);
   }
 
   // Canaryの検証
@@ -112,11 +150,11 @@ bool MultiCanary::runOnFunction(Function &F) {
     // MultiCanaryReturnの後ろに任意の数字がつく(1, 2, 3...)
     // どういう仕組みかValueの実装を読んでもよくわからなかった
     // (Value.cpp: Value::setName参照)
-    if (BB.getName().startswith(StringRef("MultiCanary"))) continue;
+    if (BB.getName().startswith(StringRef("MultiCanary")) &&
+        !BB.getName().startswith(StringRef("MultiCanaryEntryAfterAlloca"))) continue;
 
     for (auto &I : BB) {
       if (auto *RI = dyn_cast<ReturnInst>(&I)) {
-        if (CanaryAIs.size() == 0) continue;
         errs() << "Found ReturnInst!\n";
 
         // MSVC CRTではCanaryチェック用の関数が用意されているのでそれを呼び出す
@@ -153,11 +191,13 @@ bool MultiCanary::runOnFunction(Function &F) {
 
             NextCheckBB = BasicBlock::Create(CurrentBB->getContext(), "MultiCanaryReturn", &F);
 
+            errs() << "CanaryAI: \n";
+            AI->dump();
             if (!AI->isArrayAllocation()) {
               Value *Cmp = B.CreateICmpEQ(LoadCanaryTLS, LoadCanaryStack);
               B.CreateCondBr(Cmp, NextCheckBB, FailBB, Weights);
             } else {
-              BasicBlock *ValidationBB = CreateValidationBB(AI, CurrentBB, NextCheckBB, FailBB, &F, cast<ConstantInt>(AI->getArraySize())->getZExtValue(), LoadCanaryTLS, Weights);
+              BasicBlock *ValidationBB = CreateValidationBB(AI, CurrentBB, NextCheckBB, FailBB, &F, cast<ConstantInt>(AI->getArraySize())->getZExtValue(), LoadCanaryTLS, PtrSize, Weights);
               B.CreateBr(ValidationBB);
             }
           }
@@ -166,6 +206,7 @@ bool MultiCanary::runOnFunction(Function &F) {
           NextCheckBB->getInstList().push_back(RI->clone());
 
           // もともとのBBからretする代わりにMultiCanaryのチェックに飛んでくるようにする
+          FirstCheckBB->dump();
           ReplaceInstWithInst(RI, BranchInst::Create(FirstCheckBB));
         }
 
@@ -180,18 +221,18 @@ bool MultiCanary::runOnFunction(Function &F) {
 }
 
 // Canary配列の要素にに実際のCanary値をLoadするBBを追加する
-BasicBlock *MultiCanary::CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *PreviousBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, MDNode *Weights) {
+BasicBlock *MultiCanary::CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *PreviousBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, unsigned PtrSize, MDNode *Weights) {
   BasicBlock *HeadBB = BasicBlock::Create(PreviousBB->getContext(), "MultiCanaryStore", F);
   IRBuilder<> HB(HeadBB);
 
-  Value *Offset = HB.CreateAlloca(HB.getInt64Ty());
-  HB.CreateStore(ConstantInt::get(HB.getInt64Ty(), 0), Offset);
+  Value *Idx = HB.CreateAlloca(HB.getInt64Ty());
+  HB.CreateStore(ConstantInt::get(HB.getInt64Ty(), 0), Idx);
 
   // FIXME: ループもうちょっと簡単に作れないのか
   BasicBlock *LoopHeadBB = BasicBlock::Create(HeadBB->getContext(), "MultiCanaryStoreLoopHead", F);
   IRBuilder<> LHB(LoopHeadBB);
   HB.CreateBr(LoopHeadBB);
-  Value *Curr = LHB.CreateLoad(Offset);
+  Value *Curr = LHB.CreateLoad(Idx);
   Value *CmpI = LHB.CreateICmpSLT(Curr, ConstantInt::get(LHB.getInt64Ty(), nCanary));
 
   BasicBlock *LoopBodyBB = BasicBlock::Create(LoopHeadBB->getContext(), "MultiCanaryStoreLoop", F);
@@ -199,33 +240,34 @@ BasicBlock *MultiCanary::CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *Previou
   LHB.CreateCondBr(CmpI, LoopBodyBB, AfterBB, Weights);
   IRBuilder<> LB(LoopBodyBB);
 
-  Value *OffsetLoad = LB.CreateLoad(Offset, "MultiCanaryStoreOffsetLoad");
+  Value *IdxLoad = LB.CreateLoad(Idx, "MultiCanaryStoreOffsetLoad");
+  Value *Offset = LB.CreateMul(IdxLoad, ConstantInt::get(LB.getInt64Ty(), PtrSize));
   Value *IntAddr = LB.CreatePtrToInt(AI, LB.getInt64Ty());
-  Value *IntDest = LB.CreateAdd(IntAddr, OffsetLoad);
+  Value *IntDest = LB.CreateAdd(IntAddr, Offset);
   Value *PtrDest = LB.CreateIntToPtr(IntDest, PointerType::get(LB.getInt8PtrTy(), 0));
 
   LB.CreateStore(Canary, PtrDest, true);
 
   Value *NewOffset = LB.CreateAdd(Curr, ConstantInt::get(LB.getInt64Ty(), 1));
-  LB.CreateStore(NewOffset, Offset);
+  LB.CreateStore(NewOffset, Idx);
   LB.CreateBr(LoopHeadBB);
 
   return HeadBB;
 }
 
 // Canary配列内の値がすべてTLSのそれと一致するか検証するBBを追加する
-BasicBlock *MultiCanary::CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *SuccessBB, BasicBlock *FailBB, Function *F, unsigned nCanary, Value *CanaryTLS, MDNode *Weights) {
+BasicBlock *MultiCanary::CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *SuccessBB, BasicBlock *FailBB, Function *F, unsigned nCanary, Value *CanaryTLS, unsigned PtrSize, MDNode *Weights) {
   BasicBlock *HeadBB = BasicBlock::Create(ParentBB->getContext(), "MultiCanaryValidate", F);
   IRBuilder<> HB(HeadBB);
 
-  Value *Offset = HB.CreateAlloca(HB.getInt64Ty());
-  HB.CreateStore(ConstantInt::get(HB.getInt64Ty(), 0), Offset);
+  Value *Idx = HB.CreateAlloca(HB.getInt64Ty());
+  HB.CreateStore(ConstantInt::get(HB.getInt64Ty(), 0), Idx);
 
   // FIXME: ループもうちょっと簡単に作れないのか
   BasicBlock *LoopHeadBB = BasicBlock::Create(HeadBB->getContext(), "MultiCanaryValidationLoopHead", F);
   IRBuilder<> LHB(LoopHeadBB);
   HB.CreateBr(LoopHeadBB);
-  Value *Curr = LHB.CreateLoad(Offset);
+  Value *Curr = LHB.CreateLoad(Idx);
   Value *CmpI = LHB.CreateICmpSLT(Curr, ConstantInt::get(LHB.getInt64Ty(), nCanary));
   // FIXME: Weightsを単なるループの終了判定につけるのは間違っていそう
 
@@ -233,10 +275,10 @@ BasicBlock *MultiCanary::CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB
   LHB.CreateCondBr(CmpI, LoopBodyBB, SuccessBB, Weights);
   IRBuilder<> LB(LoopBodyBB);
 
-  Value *OffsetLoad = LB.CreateLoad(Offset, "MultiCanaryValidationOffsetLoad");
-
+  Value *IdxLoad = LB.CreateLoad(Idx, "MultiCanaryValidationOffsetLoad");
+  Value *Offset = LB.CreateMul(IdxLoad, ConstantInt::get(LB.getInt64Ty(), PtrSize));
   Value *IntAddr = LB.CreatePtrToInt(AI, LB.getInt64Ty());
-  Value *IntDest = LB.CreateAdd(IntAddr, OffsetLoad);
+  Value *IntDest = LB.CreateAdd(IntAddr, Offset);
   Value *PtrDest = LB.CreateIntToPtr(IntDest, PointerType::get(LB.getInt8PtrTy(), 0));
   Value *CanaryElm = LB.CreateLoad(PtrDest);
 
@@ -245,7 +287,7 @@ BasicBlock *MultiCanary::CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB
   Value *Cmp = LB.CreateICmpEQ(CanaryElm, CanaryTLS);
 
   Value *NewOffset = LB.CreateAdd(Curr, ConstantInt::get(LB.getInt64Ty(), 1));
-  LB.CreateStore(NewOffset, Offset);
+  LB.CreateStore(NewOffset, Idx);
   LB.CreateCondBr(Cmp, LoopHeadBB, FailBB, Weights);
 
   return HeadBB;

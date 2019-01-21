@@ -14,6 +14,6 @@ public:
 
 private:
   BasicBlock *CreateFailureBB(Function &F);
-  BasicBlock *CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *SuccessBB, BasicBlock *FailBB, Function *F, unsigned nCanary, Value *CanaryTLS, MDNode *Weights);
-  BasicBlock *CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, MDNode *Weights);
+  BasicBlock *CreateValidationBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *SuccessBB, BasicBlock *FailBB, Function *F, unsigned nCanary, Value *CanaryTLS, unsigned PtrSize, MDNode *Weights);
+  BasicBlock *CreateCanaryStoreBB(AllocaInst *AI, BasicBlock *ParentBB, BasicBlock *AfterBB, Function *F, unsigned nCanary, Value *Canary, unsigned PtrSize, MDNode *Weights);
 };
